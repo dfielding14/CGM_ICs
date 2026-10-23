@@ -44,6 +44,10 @@ The rotation and turbulence additions in this repo are analytic diagnostic layer
 
 ## Main Entry Points
 
+- `generate_cgm_library.py`
+  - Generates CGM-only profiles with cached results and optional multiprocessing.
+    Uses the spherical average of the input's full GOTHAM potential, including
+    the fixed stellar potential; creates no gas disk or clusters.
 - `generate_gotham_ics.py`
   - Writes a complete GOTHAM run directory: CGM and disk profiles, star clusters,
     an updated athinput, and a record of the generation parameters.
@@ -91,6 +95,20 @@ The shipped template has tlim=10 and SN/delay=10, so it ends before feedback sta
 The defaults retain the historical 2.5e9 Msun, 1e4 K, 20 kpc gas disk and 1500
 star clusters. The sonic radius is in kpc. The example notebooks do not export
 this production bundle; existing tracked tables and pickles are historical products.
+
+## Generate a CGM-only library
+
+```bash
+python generate_cgm_library.py /path/to/athinput.gotham /path/to/cgm-library --r-sonic 0.7 35 --r-max 244.8 --workers 2
+```
+
+This checks the paper's two fiducials over 0.1--244.8 kpc. Omitting `--r-max`
+requires coverage of the mesh corners including ghost cells. Repeating a command
+reuses saved profiles. No disk, clusters, or runnable athinput are generated.
+For sonic radii below 0.1 kpc, also lower `--r-min` (for example, to 0.001 kpc).
+
+See `docs/review/cgm_library.md` for the performance measurements, output format,
+warm-start limitation, and the large-radius fiducial's outer-coverage failure.
 
 ## Tests
 

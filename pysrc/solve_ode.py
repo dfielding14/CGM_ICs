@@ -122,6 +122,22 @@ class CGMSolution:
             raise ValueError("inward solution must be appended to an outward solution")
         self.inward_solution = inward_solution.result
 
+    def sample_profile(self, max_log_step: float = 0.002) -> "CGMSolution":
+        """Sample dense output without forcing the integrator onto the output grid."""
+        if not np.isfinite(max_log_step) or max_log_step <= 0:
+            raise ValueError("profile spacing must be finite and positive")
+        for result in (self.result, self.inward_solution):
+            if result is None:
+                continue
+            if result.sol is None:
+                raise ValueError("resampling requires dense integration output")
+            count = int(np.ceil((result.t[-1] - result.t[0]) / max_log_step)) + 1
+            # Keep adaptive knots so sharp cooling transitions remain resolved.
+            t = np.unique(np.concatenate((result.t, np.linspace(result.t[0], result.t[-1], count))))
+            result.y = result.sol(t)
+            result.t = t
+        return self
+
     def _combine_series(self, outward: np.ndarray, inward: Optional[np.ndarray] = None) -> np.ndarray:
         if inward is None or self.inward_solution is None:
             return outward
@@ -285,12 +301,21 @@ def shoot_from_R_sonic(
     x_low: float = 1e-5,
     x_high: float = 1.0,
     method: str = "RK45",
+    x_guess: Optional[float] = None,
+    atol: float = 1e-8,
+    rtol: float = 1e-8,
 ) -> Optional[Union[CGMSolution, Dict[float, CGMSolution]]]:
     results: Dict[float, CGMSolution] = {}
     res = None
+    if x_guess is not None and (not np.isfinite(x_guess) or not x_low < x_guess < x_high):
+        raise ValueError("x_guess must lie strictly inside the shooting bracket")
+    trials = 0
 
     while x_high - x_low > tol:
-        x = 0.5 * (x_high + x_low)
+        warm_trial = x_guess is not None
+        x = x_guess if x_guess is not None else 0.5 * (x_high + x_low)
+        x_guess = None  # A failed guess retains the full original search interval.
+        trials += 1
         printv(f"Integrating with v_c^2/c_s^2 (R_sonic) = {2 * x:f} ...", verbose, end=" ")
 
         try:
@@ -315,8 +340,12 @@ def shoot_from_R_sonic(
                 max_step,
                 verbose,
                 method,
+                atol,
+                rtol,
             )
             results[x] = res
+            res.shooting_x = x
+            res.shooting_trials = trials
             dlnM_dlnR_init = sonic_conditions["dlnM_dlnR"]
 
             if res.stop_reason in (StopReason.SONIC_POINT, StopReason.TEMPERATURE_FLOOR):
@@ -334,12 +363,16 @@ def shoot_from_R_sonic(
         except StartsUnboundError:
             x_low = x
             printv("Stop reason: Starts unbound", verbose)
+        except RuntimeError:
+            if not warm_trial:
+                raise
+            printv("Warm-start integration failed; retrying the original bracket", verbose)
 
     if return_all_results:
         return results
     if results and res is not None and res.stop_reason == StopReason.MAX_RADIUS:
         return res
-    print("No result reached R_max. Set return_all_results=True to inspect intermediate solutions.")
+    printv("No result reached R_max. Set return_all_results=True to inspect intermediate solutions.", verbose)
     return None
 
 
@@ -472,6 +505,7 @@ def IntegrateFlowEquations(
         max_step=max_step,
         atol=atol,
         rtol=rtol,
+        dense_output=True,
     )
     if not result.success:
         raise RuntimeError(f"Flow integration failed at r={np.exp(direction * result.t[-1]):.8g} kpc: {result.message}")
@@ -617,6 +651,8 @@ def _integrate_from_sonic_point(
     max_step: float,
     verbose: bool,
     method: str,
+    atol: float,
+    rtol: float,
 ) -> CGMSolution:
     return _integrate_flow_sonic(
         sonic_conditions["mass_flow_rate_Msun_per_yr"],
@@ -637,6 +673,8 @@ def _integrate_from_sonic_point(
         max_step,
         verbose,
         method,
+        atol,
+        rtol,
     )
 
 
@@ -659,6 +697,8 @@ def _integrate_flow_sonic(
     max_step: float,
     verbose: bool,
     method: str,
+    atol: float,
+    rtol: float,
 ) -> CGMSolution:
     res = None
     integration_directions = [1, -1] if calc_inward_solution else [1]
@@ -685,6 +725,8 @@ def _integrate_flow_sonic(
                 min_temperature_K=min_temperature_K,
                 max_step=max_step,
                 method=method,
+                atol=atol,
+                rtol=rtol,
             )
             printv(
                 f"Stop reason: {res.stop_reason.value} (Maximum r = {int(res.radius_kpc[-1]):d} kpc)",
@@ -708,6 +750,8 @@ def _integrate_flow_sonic(
                 min_temperature_K=min_temperature_K,
                 max_step=max_step,
                 method=method,
+                atol=atol,
+                rtol=rtol,
             )
             res.add_inward_solution(res_inward)
             printv(
