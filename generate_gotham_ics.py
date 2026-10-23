@@ -9,13 +9,13 @@ import sys
 
 import numpy as np
 from scipy.integrate import quad
+from scipy.interpolate import CubicHermiteSpline
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "pysrc"))
 import HaloPotential_new as Halo
 import WiersmaCooling as Cool
 import solve_ode as CF
 import unit_system as us
-from ClusterGenerator import ClusterParameters, StarClusterGenerator
 
 # Match src/units/units.hpp, including its historical constants.
 G_CGS = 6.67408e-8
@@ -106,6 +106,55 @@ class GalaxyPotential:
                 - np.log(self.vc_kms(np.asarray(radius_kpc) * np.exp(-step)))) / (2 * step)
 
 
+class TabulatedPotential:
+    """One Hermite interpolant for the spherical potential and its derivatives."""
+
+    def __init__(self, potential, r_min_kpc, r_max_kpc, points=2049):
+        if not 0 < r_min_kpc < r_max_kpc or points < 4:
+            raise ValueError("require 0 < r_min < r_max and at least four table points")
+        # Padding permits endpoint roundoff without extrapolating the physical domain.
+        logr = np.linspace(np.log(r_min_kpc) - 1e-6, np.log(r_max_kpc) + 1e-6, points)
+        radius = np.exp(logr)
+        self._phi = CubicHermiteSpline(logr, potential.phi_kms2(radius),
+                                      potential.vc_kms(radius)**2, extrapolate=False)
+
+    def phi_kms2(self, radius_kpc):
+        return self._phi(np.log(radius_kpc))
+
+    def vc_kms(self, radius_kpc):
+        return np.sqrt(self._phi(np.log(radius_kpc), 1))
+
+    def dln_vc_dln_r(self, radius_kpc):
+        logr = np.log(radius_kpc)
+        return 0.5 * self._phi(logr, 2) / self._phi(logr, 1)
+
+
+def outer_mesh_radius(config, units):
+    ghost = config.getint("mesh", "nghost")
+    outer_coordinates = []
+    for axis in (1, 2, 3):
+        lo, hi = (config.getfloat("mesh", f"x{axis}{side}") for side in ("min", "max"))
+        if not lo < 0 < hi:
+            raise ValueError("the GOTHAM IC mesh must straddle the galaxy center")
+        nx = config.getint("mesh", f"nx{axis}")
+        if nx <= 0 or ghost < 0:
+            raise ValueError("mesh cell counts must be positive and nghost nonnegative")
+        outer_coordinates.append(max(abs(lo), abs(hi)) + (ghost + 0.5) * (hi - lo) / nx)
+    return np.linalg.norm(outer_coordinates) * units.kpc
+
+
+def cooling_from_input(config):
+    fluid = "mhd" if config.has_section("mhd") else "hydro"
+    if not np.isclose(config.getfloat(fluid, "gamma"), CF.GC.GAMMA, rtol=1e-8, atol=0):
+        raise ValueError("the cooling-flow solver assumes gamma=5/3")
+    metallicity = config.getfloat("problem", "metallicity", fallback=1/3)
+    # GOTHAM gives the CGM D_floor; d_z_init is only applied to disk material.
+    dust_fraction = config.getfloat("dust", "D_floor", fallback=1e-20)
+    if not 0 <= dust_fraction <= 1:
+        raise ValueError("D_floor must be between zero and one")
+    return Cool.Wiersma_Cooling(metallicity * (1 - dust_fraction), 0.0)
+
+
 def disk_profile(potential, units, zmin_kpc, zmax_kpc, mass_Msun=2.5e9, temperature_K=1e4):
     radius = np.geomspace(1e-3, 20.0, 512)
     scale = potential.disk.a_kpc
@@ -130,14 +179,13 @@ def disk_profile(potential, units, zmin_kpc, zmax_kpc, mass_Msun=2.5e9, temperat
 
 def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
              f_T=1.0, boundary_radius_kpc=None):
+    from ClusterGenerator import ClusterParameters, StarClusterGenerator
+
     output_dir = Path(output_dir)
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite {output_dir}")
     config = read_input(athinput)
     units = CodeUnits(config)
-    fluid = "mhd" if config.has_section("mhd") else "hydro"
-    if not np.isclose(config.getfloat(fluid, "gamma"), CF.GC.GAMMA, rtol=1e-8, atol=0):
-        raise ValueError("the cooling-flow solver assumes gamma=5/3")
     potential = GalaxyPotential(config, units)
     if boundary_radius_kpc is None:
         boundary_radius_kpc = 1.5 * config.getfloat("potential", "r_200") * units.kpc
@@ -148,34 +196,25 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
     boundary_temperature_K = float(f_T * units.mu * us.M_P_G
                                    * (potential.vc_kms(boundary_radius_kpc) * us.KM_TO_CM)**2
                                    / (CF.GC.GAMMA * KB_CGS))
+    cooling = cooling_from_input(config)
     metallicity = config.getfloat("problem", "metallicity", fallback=1/3)
-    # GOTHAM gives the CGM D_floor; d_z_init is only applied to disk material.
     dust_fraction = config.getfloat("dust", "D_floor", fallback=1e-20)
-    if not 0 <= dust_fraction <= 1:
-        raise ValueError("D_floor must be between zero and one")
-    cooling = Cool.Wiersma_Cooling(metallicity * (1 - dust_fraction), 0.0)
-    ghost = config.getint("mesh", "nghost")
-    outer_coordinates = []
-    for axis in (1, 2, 3):
+    mesh_radius = outer_mesh_radius(config, units)
+    for axis in (1, 2):
         lo, hi = (config.getfloat("mesh", f"x{axis}{side}") for side in ("min", "max"))
-        if not lo < 0 < hi:
-            raise ValueError("the GOTHAM IC mesh must straddle the galaxy center")
-        nx = config.getint("mesh", f"nx{axis}")
-        if nx <= 0 or ghost < 0:
-            raise ValueError("mesh cell counts must be positive and nghost nonnegative")
-        if axis < 3 and min(-lo, hi) * units.kpc < 20:
+        if min(-lo, hi) * units.kpc < 20:
             raise ValueError("the mesh must contain the 20 kpc disk in both horizontal directions")
-        outer_coordinates.append(max(abs(lo), abs(hi)) + (ghost + 0.5) * (hi - lo) / nx)
-    mesh_radius = np.linalg.norm(outer_coordinates) * units.kpc
     outer_radius = max(mesh_radius, boundary_radius_kpc)
-    # Resolve the sharp inner cooling transition in the table read by GOTHAM.
+    flow_potential = TabulatedPotential(potential, 0.1, outer_radius)
+    # Temperature shooting needs tighter tolerances than legacy bound/unbound selection.
     solution = CF.shoot_from_R_sonic_outer_temperature(
-        potential, cooling, sonic_radius_kpc, boundary_radius_kpc, boundary_temperature_K,
-        outer_radius, 0.1, max_step=0.002, epsilon=1e-4, verbose=True)
+        flow_potential, cooling, sonic_radius_kpc, boundary_radius_kpc, boundary_temperature_K,
+        outer_radius, 0.1, max_step=np.inf, epsilon=1e-4, atol=1e-10, rtol=1e-10, verbose=True)
     if solution is None or not np.isclose(solution.radius_kpc[-1], outer_radius, rtol=1e-8):
         raise RuntimeError("no cooling flow reaches the outer mesh, including ghost cells")
     if not np.isclose(solution.radius_kpc[0], 0.1, rtol=1e-8):
         raise RuntimeError("the inward solution did not reach 0.1 kpc")
+    solution.sample_profile()
     if (np.any(solution.nH_cm3 < 1e-8) or np.any(solution.temperature_K < 100)
             or np.any(solution.temperature_K > 9.1612998e8)):
         raise ValueError("the flow extends beyond GOTHAM's cooling-table domain")

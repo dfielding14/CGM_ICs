@@ -44,6 +44,10 @@ The rotation and turbulence additions in this repo are analytic diagnostic layer
 
 ## Main Entry Points
 
+- `generate_cgm_library.py`
+  - Generates CGM-only profiles with cached results and optional multiprocessing.
+    Uses the spherical average of the input's full GOTHAM potential, including
+    the fixed stellar potential; creates no gas disk or clusters.
 - `generate_gotham_ics.py`
   - Writes a complete GOTHAM run directory: CGM and disk profiles, star clusters,
     an updated athinput, and a record of the generation parameters.
@@ -123,6 +127,22 @@ Run `python compare_outer_temperature.py --output-dir /path/to/new-comparison`
 to compare sonic radii 1 and 20 kpc at f_T=0.5, 1, and 2. This command accepts
 `--athinput` and `--r-boundary-kpc`. Results and the fiducial figures are described
 in `docs/review/outer_temperature_comparison.md`.
+
+## Generate a CGM-only library with the legacy boundary
+
+```bash
+python generate_cgm_library.py /path/to/athinput.gotham /path/to/cgm-library --r-sonic 0.7 35 --r-max 244.8 --workers 2
+```
+
+This utility retains the legacy Bernoulli selection, not the outer-temperature
+condition above. Use `generate_gotham_ics.py` or `compare_outer_temperature.py`
+for temperature-matched flows. This checks the paper's two fiducials over 0.1--244.8 kpc. Omitting `--r-max`
+requires coverage of the mesh corners including ghost cells. Repeating a command
+reuses saved profiles. No disk, clusters, or runnable athinput are generated.
+For sonic radii below 0.1 kpc, also lower `--r-min` (for example, to 0.001 kpc).
+
+See `docs/review/cgm_library.md` for the performance measurements, output format,
+warm-start limitation, and the large-radius fiducial's outer-coverage failure.
 
 ## Tests
 

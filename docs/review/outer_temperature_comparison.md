@@ -98,8 +98,18 @@ The branch search samples $10^{-5}\le x\le1-10^{-5}$, refines successful/failed
 transitions, and rejects detected multiple brackets. It does not prove global
 uniqueness or nonexistence in other potentials. The boundary temperature must
 exceed the solver's 20,000 K outer-branch floor. The comparison used a maximum
-log-radius step of 0.01; production exports use 0.002. Both temperature targets
-use GOTHAM's historical constants.
+log-radius step of 0.01; the original production exports used 0.002. After merging
+the upstream optimizations, production exports use tabulated gravity and
+adaptive integration at $10^{-10}$ tolerances, then sample dense output with a
+maximum log-radius spacing of 0.002. Both temperature targets use GOTHAM's
+historical constants.
+
+The merged fast solver matches all six boundary targets within $2.5\times10^{-6}$
+and retains the same four successful mesh extensions and two outer sonic-point
+failures. At $f_T=1$, the 1 and 20 kpc mass inflow rates differ from the saved
+original exports by less than $6\times10^{-8}$ fractionally. The tighter adaptive
+tolerance is needed because $10^{-9}$ produced a noisy temperature residual for
+the fiducial 1 kpc flow. The acceptance tolerance was not loosened.
 
 No 1 Gyr relaxation or full three-dimensional evolution was run. In particular,
 this does not remove the intended need to relax spherical ICs in the full

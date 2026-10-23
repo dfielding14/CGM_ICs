@@ -51,6 +51,20 @@ def test_boundary_is_independent_of_profile_extent(boundary_problem):
         reference.mass_flow_rate_Msun_per_yr, rel=2e-5)
 
 
+def test_resampling_preserves_extension_beyond_temperature_boundary(boundary_problem):
+    potential, cooling, reference = boundary_problem
+    solution = solve(potential, cooling, reference.temperature_K[-1], outer_radius=20.)
+    knots = solution.result.t.copy()
+    values = solution.result.y.copy()
+    assert solution.result.sol.ts[-1] == pytest.approx(np.log(20.))
+    assert np.any(knots > np.log(10.))
+    solution.sample_profile()
+    indices = np.searchsorted(solution.result.t, knots)
+    np.testing.assert_array_equal(solution.result.t[indices], knots)
+    np.testing.assert_allclose(solution.result.y[:, indices], values, rtol=0, atol=1e-10)
+    assert solution.radius_kpc[-1] == pytest.approx(20.)
+
+
 def test_potential_zero_cannot_select_the_flow(boundary_problem):
     _, cooling, reference = boundary_problem
     positive_potential = Halo.PowerLaw(0, 100, 100, R_phi0_kpc=.001)
