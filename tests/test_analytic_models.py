@@ -57,3 +57,12 @@ def test_turbulence_closure_switches_between_hot_and_cool_regimes():
     assert np.all(hot.regime == "hot-inflow")
     assert np.all(cool.regime == "turbulence-dominated")
     assert np.all(cool.sigma_turb_kms > hot.sigma_turb_kms)
+
+
+def test_cooling_driven_diagnostics_are_undefined_for_net_heating():
+    solution = MockSolution([-1.0, np.inf])
+    turbulence = infer_turbulence_diagnostics(solution)
+    rotation = infer_rotation_diagnostics(solution, RotationConfig(R_circ_kpc=10.0))
+    assert np.all(turbulence.regime == "no-net-cooling")
+    assert np.all(np.isnan(turbulence.sigma_turb_kms))
+    assert np.all(np.isnan(rotation.winding_ratio))

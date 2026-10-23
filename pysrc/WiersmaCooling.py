@@ -6,7 +6,6 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from scipy import interpolate
 
 import numpy_compat  # noqa: F401
 
@@ -21,15 +20,6 @@ def _broadcast_shape(*values):
 
 def _safe_log(values):
     return np.log(np.clip(np.asarray(values, dtype=float), np.finfo(float).tiny, None))
-
-
-def _evaluate_interpolator(interpolator, x, y):
-    x_arr, y_arr = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
-    points = np.column_stack([x_arr.ravel(), y_arr.ravel()])
-    values = np.asarray(interpolator(points), dtype=float).reshape(x_arr.shape)
-    if values.shape == ():
-        return float(values)
-    return values
 
 
 def _closest_index(values: np.ndarray, target: float) -> int:
@@ -54,92 +44,73 @@ class Constant_Cooling:
 
 
 class Wiersma_Cooling:
-    """Wiersma et al. (2009) cooling tables in float-native form."""
+    """Signed net cooling, bilinear in log T and log nH; clamp at table edges.
+
+    Use Y=0.248, the primordial H/He table also shipped in GOTHAM. Metal rates
+    scale linearly with gas-phase Z/Zsun, as in GOTHAM's optically thin limit.
+    """
 
     def __init__(self, Z2Zsun: float, z: float):
+        if not np.isfinite(Z2Zsun) or Z2Zsun < 0 or not np.isfinite(z):
+            raise ValueError("metallicity must be nonnegative and redshift finite")
         files = []
         redshifts = []
         for table_path in sorted(DATA_DIR.glob("z_*.hdf5")):
-            label = table_path.stem.removeprefix("z_")
             try:
-                redshifts.append(float(label))
-                files.append(table_path)
+                redshift = float(table_path.stem.removeprefix("z_"))
             except ValueError:
                 continue
-
+            redshifts.append(redshift)
+            files.append(table_path)
         if not files:
             raise FileNotFoundError(f"no Wiersma cooling tables found under {DATA_DIR}")
-
-        redshifts = np.asarray(redshifts, dtype=float)
-        table_path = files[_closest_index(redshifts, z)]
-
-        with h5py.File(table_path, "r") as handle:
-            helium_to_hydrogen = 10.0 ** -1.07 * (0.71553 + 0.28447 * Z2Zsun)
-            hydrogen_mass_fraction = (1.0 - 0.014 * Z2Zsun) / (1.0 + 4.0 * helium_to_hydrogen)
-            helium_mass_fraction = 4.0 * helium_to_hydrogen * hydrogen_mass_fraction
-
-            helium_bins = np.asarray(handle["Metal_free"]["Helium_mass_fraction_bins"][...], dtype=float)
-            helium_index = _closest_index(helium_bins, helium_mass_fraction)
-
-            hydrogen_helium = np.asarray(handle["Metal_free"]["Net_Cooling"][helium_index, ...], dtype=float)
-            temperature_bins = np.asarray(handle["Metal_free"]["Temperature_bins"][...], dtype=float)
-            hydrogen_density_bins = np.asarray(handle["Metal_free"]["Hydrogen_density_bins"][...], dtype=float)
-            metal_cooling = np.asarray(handle["Total_Metals"]["Net_cooling"][...], dtype=float) * float(Z2Zsun)
-
-        log_temperature = _safe_log(temperature_bins)
-        log_density = _safe_log(hydrogen_density_bins)
-        cooling_table = metal_cooling + hydrogen_helium
-        cooling_table = np.clip(cooling_table, np.finfo(float).tiny, None)
-
-        self._cooling_interpolator = interpolate.RegularGridInterpolator(
-            (log_temperature, log_density),
-            cooling_table,
-            bounds_error=False,
-            fill_value=None,
-        )
-
-        dlogT = float(np.mean(np.diff(log_temperature)))
-        dlogn = float(np.mean(np.diff(log_density)))
-        log_cooling = np.log(cooling_table)
-        dln_lambda_dln_T, dln_lambda_dln_rho = np.gradient(log_cooling, dlogT, dlogn, edge_order=2)
-
-        self._dln_lambda_dln_T_interpolator = interpolate.RegularGridInterpolator(
-            (log_temperature, log_density),
-            dln_lambda_dln_T,
-            bounds_error=False,
-            fill_value=None,
-        )
-        self._dln_lambda_dln_rho_interpolator = interpolate.RegularGridInterpolator(
-            (log_temperature, log_density),
-            dln_lambda_dln_rho,
-            bounds_error=False,
-            fill_value=None,
-        )
+        if not min(redshifts) <= z <= max(redshifts):
+            raise ValueError("redshift is outside the Wiersma tables")
+        index = _closest_index(redshifts, z)
+        self.redshift = redshifts[index]
+        with h5py.File(files[index], "r") as handle:
+            helium_index = _closest_index(handle["Metal_free/Helium_mass_fraction_bins"][...], 0.248)
+            self._rates = (np.asarray(handle["Metal_free/Net_Cooling"][helium_index, ...], dtype=float)
+                           + Z2Zsun * np.asarray(handle["Total_Metals/Net_cooling"][...], dtype=float))
+            self._logT = np.log(np.asarray(handle["Metal_free/Temperature_bins"][...], dtype=float))
+            self._logn = np.log(np.asarray(handle["Metal_free/Hydrogen_density_bins"][...], dtype=float))
 
     @classmethod
     def from_config(cls, config):
         return cls(Z2Zsun=config.metallicity_solar, z=config.redshift)
 
+    def _evaluate(self, temperature_K, nH_cm3, derivative=None):
+        temperature, density = np.broadcast_arrays(np.asarray(temperature_K, dtype=float),
+                                                  np.asarray(nH_cm3, dtype=float))
+        if np.any(~np.isfinite(temperature) | ~np.isfinite(density) | (temperature <= 0) | (density <= 0)):
+            raise ValueError("temperature and hydrogen density must be finite and positive")
+        logT, logn = np.log(temperature), np.log(density)
+        x, y = np.clip(logT, self._logT[0], self._logT[-1]), np.clip(logn, self._logn[0], self._logn[-1])
+        i = np.clip(np.searchsorted(self._logT, x, side="right") - 1, 0, len(self._logT) - 2)
+        j = np.clip(np.searchsorted(self._logn, y, side="right") - 1, 0, len(self._logn) - 2)
+        dx, dy = self._logT[i + 1] - self._logT[i], self._logn[j + 1] - self._logn[j]
+        t, n = (x - self._logT[i]) / dx, (y - self._logn[j]) / dy
+        f00, f10 = self._rates[i, j], self._rates[i + 1, j]
+        f01, f11 = self._rates[i, j + 1], self._rates[i + 1, j + 1]
+        rate = (1 - t) * ((1 - n) * f00 + n * f01) + t * ((1 - n) * f10 + n * f11)
+        if derivative is None:
+            return rate
+        if np.any(rate <= 0):
+            raise ValueError("logarithmic cooling slopes require positive net cooling")
+        if derivative == 0:
+            slope = ((1 - n) * (f10 - f00) + n * (f11 - f01)) / (dx * rate)
+            return np.where((logT < self._logT[0]) | (logT > self._logT[-1]), 0.0, slope)
+        slope = ((1 - t) * (f01 - f00) + t * (f11 - f10)) / (dy * rate)
+        return np.where((logn < self._logn[0]) | (logn > self._logn[-1]), 0.0, slope)
+
     def lambda_cgs(self, temperature_K, nH_cm3):
-        return _evaluate_interpolator(
-            self._cooling_interpolator,
-            _safe_log(temperature_K),
-            _safe_log(nH_cm3),
-        )
+        return self._evaluate(temperature_K, nH_cm3)
 
     def dln_lambda_dln_T(self, temperature_K, nH_cm3):
-        return _evaluate_interpolator(
-            self._dln_lambda_dln_T_interpolator,
-            _safe_log(temperature_K),
-            _safe_log(nH_cm3),
-        )
+        return self._evaluate(temperature_K, nH_cm3, derivative=0)
 
     def dln_lambda_dln_rho(self, temperature_K, nH_cm3):
-        return _evaluate_interpolator(
-            self._dln_lambda_dln_rho_interpolator,
-            _safe_log(temperature_K),
-            _safe_log(nH_cm3),
-        )
+        return self._evaluate(temperature_K, nH_cm3, derivative=1)
 
 
 class Kartick_Cooling:

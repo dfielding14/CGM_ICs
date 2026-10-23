@@ -111,6 +111,7 @@ def maximum_hot_mode_accretion_rate(
 
 def infer_rotation_diagnostics(solution, rotation: RotationConfig) -> RotationDiagnostics:
     tcool_to_tff = solution.cooling_time_Gyr / solution.free_fall_time_Gyr
+    tcool_to_tff = np.where(np.isfinite(tcool_to_tff) & (tcool_to_tff > 0), tcool_to_tff, np.nan)
     v_phi_kms = rotation.rotation_velocity_kms(solution.radius_kpc, solution.potential)
     winding_ratio = rotation.winding_ratio(solution.radius_kpc, tcool_to_tff)
     rcirc_idx = int(np.argmin(np.abs(solution.radius_kpc - rotation.R_circ_kpc)))
@@ -131,10 +132,12 @@ def infer_turbulence_diagnostics(
     config: TurbulenceConfig = TurbulenceConfig(),
 ) -> TurbulenceDiagnostics:
     tcool_to_tff = solution.cooling_time_Gyr / solution.free_fall_time_Gyr
+    cooling = np.isfinite(tcool_to_tff) & (tcool_to_tff > 0)
+    tcool_to_tff = np.where(cooling, tcool_to_tff, np.nan)
     sigma_hot_kms = np.abs(solution.velocity_kms) / (2.0 * config.eta_subsonic)
     sigma_cool_kms = config.saturation_factor * solution.potential.vc_kms(solution.radius_kpc)
     is_cool = tcool_to_tff < config.transition_tcool_to_tff
-    sigma_turb_kms = np.where(is_cool, sigma_cool_kms, sigma_hot_kms)
+    sigma_turb_kms = np.where(cooling, np.where(is_cool, sigma_cool_kms, sigma_hot_kms), np.nan)
 
     pressure_turb_dyne_cm2 = solution.density_cgs * (sigma_turb_kms * us.KM_TO_CM) ** 2 / 3.0
     mach_turb = sigma_turb_kms / solution.sound_speed_kms
@@ -144,7 +147,7 @@ def infer_turbulence_diagnostics(
         np.sqrt(np.log1p((config.forcing_b * mach_turb) ** 2)),
         0.5 / config.eta_subsonic / np.clip(tcool_to_tff, 1e-12, None),
     )
-    regime = np.where(is_cool, "turbulence-dominated", "hot-inflow")
+    regime = np.where(cooling, np.where(is_cool, "turbulence-dominated", "hot-inflow"), "no-net-cooling")
 
     return TurbulenceDiagnostics(
         sigma_turb_kms=sigma_turb_kms,

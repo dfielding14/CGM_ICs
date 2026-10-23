@@ -44,6 +44,9 @@ The rotation and turbulence additions in this repo are analytic diagnostic layer
 
 ## Main Entry Points
 
+- `generate_gotham_ics.py`
+  - Writes a complete GOTHAM run directory: CGM and disk profiles, star clusters,
+    an updated athinput, and a record of the generation parameters.
 - `ipynb/m82_cooling_flow_walkthrough.ipynb`
   - Main end-to-end tutorial notebook.
   - Builds an M82-motivated halo, sweeps `R_sonic`, compares the full solution family, and then layers on rotation and turbulence diagnostics.
@@ -66,13 +69,36 @@ The rotation and turbulence additions in this repo are analytic diagnostic layer
   - Audit of numerical, API, and implementation issues found during the review.
 - `docs/review/reproducibility_and_notebooks.md`
   - Notebook dependency map, smoke-test baseline, and reproducibility notes.
+- `docs/review/gotham_integration.md`
+  - GOTHAM export conventions, physics corrections, validation, and remaining approximations.
+
+## Generate GOTHAM initial conditions
+
+Install the dependencies and pass the GOTHAM input that will be used for the run:
+
+```bash
+python -m pip install -r requirements.txt
+python generate_gotham_ics.py /path/to/athenak/inputs/gotham/athinput.gotham /path/to/new-run --r-sonic 0.7
+cd /path/to/new-run
+/path/to/athena -i athinput.gotham
+```
+
+The output directory must not already exist. Run AthenaK from inside it so the
+relative table paths resolve. The generator reads the potential, units, mesh,
+and CGM gas metallicity from the input; it preserves run and supernova timing.
+The shipped template has tlim=10 and SN/delay=10, so it ends before feedback starts.
+
+The defaults retain the historical 2.5e9 Msun, 1e4 K, 20 kpc gas disk and 1500
+star clusters. The sonic radius is in kpc. The example notebooks do not export
+this production bundle; existing tracked tables and pickles are historical products.
 
 ## Tests
 
 Run:
 
 ```bash
-pytest -q
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 The test suite covers:

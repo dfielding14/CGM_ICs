@@ -102,6 +102,7 @@ class CGMSolution:
         mass_flow_rate_Msun_per_yr: float,
         stop_reason: StopReason,
         direction: int = 1,
+        R_circ_kpc: float = 0.0,
     ) -> None:
         if direction not in (-1, 1):
             raise ValueError("direction must be -1 or 1")
@@ -111,10 +112,10 @@ class CGMSolution:
         self.result = integration_result
         self.mass_flow_rate_Msun_per_yr = float(mass_flow_rate_Msun_per_yr)
         self.direction = int(direction)
+        self.specific_angular_momentum = (float(potential.vc_kms(R_circ_kpc)) * R_circ_kpc
+                                          if R_circ_kpc > 0 else 0.0)
         self.inward_solution = None
         self.stop_reason = stop_reason
-        if np.any(self.bernoulli_kms2 > 0.0):
-            self.stop_reason = StopReason.UNBOUND
 
     def add_inward_solution(self, inward_solution: "CGMSolution") -> None:
         if self.direction != 1 or inward_solution.direction != -1:
@@ -190,6 +191,7 @@ class CGMSolution:
     def bernoulli_kms2(self) -> np.ndarray:
         return (
             0.5 * self.velocity_kms**2
+            + 0.5 * (self.specific_angular_momentum / self.radius_kpc)**2
             + self.sound_speed_squared_kms2 / GC.GAMMA_M1
             + self.potential.phi_kms2(self.radius_kpc)
         )
@@ -219,11 +221,10 @@ class CGMSolution:
 
     @property
     def gas_mass_Msun(self) -> np.ndarray:
-        return us.shell_mass_Msun(
-            self.radius_kpc,
-            self.density_cgs,
-            np.gradient(self.radius_kpc),
-        ).cumsum()
+        radius_cm = self.radius_kpc * us.KPC_TO_CM
+        return scipy.integrate.cumulative_trapezoid(
+            4.0 * np.pi * radius_cm**2 * self.density_cgs, radius_cm, initial=0.0
+        ) / us.MSUN_TO_G
 
     @property
     def cooling_luminosity_density_cgs(self) -> np.ndarray:
@@ -234,14 +235,20 @@ class CGMSolution:
         return us.compton_y_integrand_cm_inverse(self.nE_cm3, self.temperature_K)
 
     def cooling_radius_kpc(self, time_Gyr: float) -> float:
-        return float(
-            10.0
-            ** np.interp(
-                np.log10(time_Gyr),
-                np.log10(self.cooling_time_Gyr),
-                np.log10(self.radius_kpc),
-            )
-        )
+        """Outermost resolved crossing of tcool=time; NaN if none is bracketed."""
+        if not np.isfinite(time_Gyr) or time_Gyr <= 0:
+            raise ValueError("the reference time must be finite and positive")
+        cooling_time = self.cooling_time_Gyr
+        valid = np.isfinite(cooling_time) & (cooling_time > 0)
+        crossings = np.flatnonzero(valid[:-1] & valid[1:] &
+            ((cooling_time[:-1] - time_Gyr) * (cooling_time[1:] - time_Gyr) <= 0))
+        if not len(crossings):
+            return float("nan")
+        i = crossings[-1]
+        if cooling_time[i] == cooling_time[i + 1]:
+            return float(self.radius_kpc[i + 1])
+        fraction = np.log(time_Gyr / cooling_time[i]) / np.log(cooling_time[i + 1] / cooling_time[i])
+        return float(self.radius_kpc[i] * (self.radius_kpc[i + 1] / self.radius_kpc[i])**fraction)
 
     @property
     def sonic_radius_kpc(self) -> Optional[float]:
@@ -361,7 +368,7 @@ def shoot_from_R_circ(
         density_cgs = (
             mass_flow_rate_Msun_per_yr
             * us.MSUN_PER_YR_TO_G_PER_S
-            / (4.0 * np.pi * (R_circ_kpc * us.KPC_TO_CM) ** 2 * v0_kms * us.KM_TO_CM)
+            / (4.0 * np.pi * (R_circ_kpc * (1.0 + epsilon) * us.KPC_TO_CM) ** 2 * v0_kms * us.KM_TO_CM)
         )
         printv(f"Integrating with log T(R_circ) = {np.log10(T0_K):.2f} ...", verbose, end=" ")
 
@@ -396,7 +403,7 @@ def shoot_from_R_circ(
                 break
         except StartsUnboundError:
             printv("Stop reason: Starts unbound", verbose)
-            break
+            T_high_K = T0_K
 
     if return_all_results:
         return results
@@ -417,19 +424,26 @@ def IntegrateFlowEquations(
     R_max_kpc: float,
     R_circ_kpc: float = 0.0,
     max_step: float = 0.1,
-    atol: float = 1e-6,
-    rtol: float = 1e-6,
+    atol: float = 1e-8,
+    rtol: float = 1e-8,
     check_unbound: bool = True,
     is_supersonic: bool = False,
     terminal_unbound: bool = True,
     min_temperature_K: float = 2e4,
     method: str = "RK45",
 ) -> CGMSolution:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    initial = [mass_flow_rate_Msun_per_yr, temperature_K, density_cgs, R_min_kpc, R_max_kpc]
+    if not np.all(np.isfinite(initial)) or min(initial) <= 0 or R_min_kpc >= R_max_kpc:
+        raise ValueError("positive finite initial conditions and R_min < R_max are required")
+    if not np.isfinite(R_circ_kpc) or R_circ_kpc < 0:
+        raise ValueError("R_circ must be finite and nonnegative")
     ln_R_range = direction * np.log([R_min_kpc, R_max_kpc][:: int(direction)])
     init_vals = (np.log(temperature_K), np.log(density_cgs))
 
     if terminal_unbound and check_unbound:
-        if _check_if_unbound(ln_R_range[0], init_vals, mass_flow_rate_Msun_per_yr, potential, direction) > 0:
+        if _check_if_unbound(ln_R_range[0], init_vals, mass_flow_rate_Msun_per_yr, potential, direction, R_circ_kpc) > 0:
             raise StartsUnboundError("flow starts unbound")
 
     ode_system = _create_ode_system(
@@ -447,6 +461,7 @@ def IntegrateFlowEquations(
         terminal_unbound,
         min_temperature_K,
         direction,
+        R_circ_kpc,
     )
     result = scipy.integrate.solve_ivp(
         ode_system,
@@ -458,7 +473,10 @@ def IntegrateFlowEquations(
         atol=atol,
         rtol=rtol,
     )
-    stop_reason = _get_stop_reason(result.t_events, check_unbound, is_supersonic)
+    if not result.success:
+        raise RuntimeError(f"Flow integration failed at r={np.exp(direction * result.t[-1]):.8g} kpc: {result.message}")
+    stop_reason = (StopReason.MAX_RADIUS if result.status == 0 else
+                   _get_stop_reason(result.t_events, check_unbound, is_supersonic))
     return CGMSolution(
         cooling,
         potential,
@@ -466,6 +484,7 @@ def IntegrateFlowEquations(
         mass_flow_rate_Msun_per_yr,
         stop_reason,
         direction=direction,
+        R_circ_kpc=R_circ_kpc,
     )
 
 
@@ -475,6 +494,7 @@ def _check_if_unbound(
     mass_flow_rate_Msun_per_yr: float,
     potential: Potential,
     direction: int,
+    R_circ_kpc: float = 0.0,
 ) -> float:
     radius_kpc = np.exp(direction * ln_R)
     ln_temperature, ln_density = y
@@ -484,6 +504,8 @@ def _check_if_unbound(
     velocity_kms = us.mass_flow_to_velocity_kms(mass_flow_rate_Msun_per_yr, radius_kpc, density_cgs)
     cs2_kms2 = us.sound_speed_squared_kms2(temperature_K, GC.GAMMA, GC.MU)
     bernoulli_kms2 = 0.5 * velocity_kms**2 + cs2_kms2 / GC.GAMMA_M1 + potential.phi_kms2(radius_kpc)
+    if R_circ_kpc > 0:
+        bernoulli_kms2 += 0.5 * (potential.vc_kms(R_circ_kpc) * R_circ_kpc / radius_kpc)**2
     return float(bernoulli_kms2)
 
 
@@ -494,6 +516,8 @@ def _create_ode_system(
     R_circ_kpc: float,
     direction: int,
 ) -> Callable[[float, np.ndarray], np.ndarray]:
+    specific_angular_momentum = (float(potential.vc_kms(R_circ_kpc)) * R_circ_kpc
+                                 if R_circ_kpc > 0 else 0.0)
     def odes(ln_R, y):
         radius_kpc = np.exp(direction * ln_R)
         ln_temperature, ln_density = y
@@ -505,7 +529,7 @@ def _create_ode_system(
         cs2_kms2 = us.sound_speed_squared_kms2(temperature_K, GC.GAMMA, GC.MU)
         mach_number = velocity_kms / np.sqrt(cs2_kms2)
 
-        vc2_kms2 = potential.vc_kms(radius_kpc) ** 2 * (1.0 - (R_circ_kpc / radius_kpc) ** 2)
+        vc2_kms2 = potential.vc_kms(radius_kpc) ** 2 - (specific_angular_momentum / radius_kpc)**2
         v_ratio = vc2_kms2 / cs2_kms2
 
         t_flow_Gyr = us.flow_time_Gyr(radius_kpc, velocity_kms)
@@ -538,6 +562,7 @@ def _create_event_functions(
     terminal_unbound: bool,
     min_temperature_K: float,
     direction: int,
+    R_circ_kpc: float = 0.0,
 ) -> Tuple[Callable[..., float], ...]:
     def sonic_point(ln_R, y):
         radius_kpc = np.exp(direction * ln_R)
@@ -553,7 +578,7 @@ def _create_event_functions(
         return float(np.exp(y[0]) - min_temperature_K)
 
     def unbound(ln_R, y):
-        return _check_if_unbound(ln_R, y, mass_flow_rate_Msun_per_yr, potential, direction)
+        return _check_if_unbound(ln_R, y, mass_flow_rate_Msun_per_yr, potential, direction, R_circ_kpc)
 
     sonic_point.terminal = True
     low_temperature.terminal = True
@@ -573,10 +598,9 @@ def _get_stop_reason(t_events, check_unbound: bool, is_supersonic: bool) -> Stop
         stop_reasons.append(StopReason.TEMPERATURE_FLOOR)
     if check_unbound:
         stop_reasons.append(StopReason.UNBOUND)
-    for events, reason in zip(t_events, stop_reasons):
-        if len(events) > 0:
-            return reason
-    return StopReason.MAX_RADIUS
+    # A nonterminal unbound crossing can precede the event that actually stopped us.
+    return max(((events[-1], reason) for events, reason in zip(t_events, stop_reasons)
+                if len(events) > 0), key=lambda event: event[0])[1]
 
 
 def _integrate_from_sonic_point(
@@ -778,7 +802,8 @@ def _calc_rho_from_tflow_to_tcool(
         return implied_velocity_kms - velocity_kms
 
     try:
-        nH_cm3 = scipy.optimize.brentq(velocity_residual, 1e-7, 1e10)
+        log_nH = scipy.optimize.brentq(lambda log_n: velocity_residual(10.0**log_n), -12.0, 10.0)
+        nH_cm3 = 10.0**log_nH
     except ValueError as exc:
         raise NoValidDensityError from exc
     return float(nH_cm3 * us.M_P_G / GC.X)
