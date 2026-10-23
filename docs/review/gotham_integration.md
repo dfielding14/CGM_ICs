@@ -72,10 +72,18 @@ inflow rate are outputs. The endpoint includes both the physical matching radius
 and corner ghost cells, whichever is farther out. The solver requires
 $0.1\,{\rm kpc}<R_{\rm sonic}<R_b$ and permits sonic points beyond the mesh.
 
-This boundary replaces the exporter's former bound/unbound trial selection.
+An alternative `--cooling-to-flow [q_b]` imposes $t_{\rm cool}/t_{\rm flow}=q_b$
+at the same $R_b$, with $q_b=1$ when the argument is omitted. The cooling time
+uses the net cooling rate from the flow equations, and $t_{\rm flow}=r/|v_r|$.
+This sets the steady entropy slope $d\ln(P/\rho^\gamma)/d\ln r=1/q_b$ and
+lets the boundary temperature emerge. Heating-dominated boundary states are
+rejected. `--f-t` and `--cooling-to-flow` are mutually exclusive; metadata
+records the selected condition and target.
+
+These boundaries replace the exporter's former bound/unbound trial selection.
 The outer-halo potential is confining and has no finite zero at infinity, so
-the sign of its Bernoulli parameter cannot define escape. The temperature mode
-therefore disables that rejection and is invariant under additive potential
+the sign of its Bernoulli parameter cannot define escape. Both modes
+therefore disable that rejection and are invariant under additive potential
 offsets. The older `shoot_from_R_sonic` retains its behavior for notebook users.
 The former baseline export's approximately $0.146\,M_\odot\,{\rm yr}^{-1}$ was
 selected by that older criterion and is not a prediction of the new boundary.

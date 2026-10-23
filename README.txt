@@ -110,18 +110,35 @@ temperature is varied to satisfy this condition; density and accretion rate are
 outputs. The matching radius is independent of mesh geometry. Profiles extend
 to whichever is larger: the matching radius or the outer corner ghost cells.
 Require $0.1\,{\rm kpc}<R_{\rm sonic}<R_b$; the sonic radius can exceed the mesh
-radius. The output `ic_parameters.json` records $R_b$, target temperature, and
-$f_T$. Failure to match the target or cover the requested radial interval raises
-an error. The finite shooting search does not prove global uniqueness or
+radius. The output `ic_parameters.json` records $R_b$ and the selected boundary
+target. Failure to match the target or cover the requested radial interval
+raises an error. The finite shooting search does not prove global uniqueness or
 nonexistence; the imposed outer temperature must exceed 20,000 K.
 
+Alternatively, select `--cooling-to-flow` to impose net $t_{\rm cool}/t_{\rm flow}=1$
+at the same radius, or `--cooling-to-flow 0.5` for another positive ratio. This
+replaces the temperature condition; the outer temperature becomes an output.
+The two CLI options are mutually exclusive. Here $t_{\rm flow}=r/|v_r|$ and
+$t_{\rm cool}$ uses the same net cooling rate as the flow equations;
+heating-dominated boundary states cannot satisfy a positive ratio. For the
+steady flow, this ratio sets $d\ln(P/\rho^\gamma)/d\ln r=1/q_b$.
+
 The corresponding Python API is
-`generate(athinput, output_dir, sonic_radius_kpc=1, f_T=1, boundary_radius_kpc=None)`.
+`generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42, f_T=1, boundary_radius_kpc=None, cooling_to_flow_ratio=None)`.
+Set `cooling_to_flow_ratio=1` to choose the timescale condition; a nondefault
+`f_T` cannot be supplied with it.
 For direct solver use, call
 `shoot_from_R_sonic_outer_temperature(potential, cooling, R_sonic_kpc, R_boundary_kpc, T_boundary_K, R_max_kpc, R_min_kpc)`.
-This mode does not use a Bernoulli-sign cut, so an additive potential constant
+For either condition, the shared solver is
+`shoot_from_R_sonic_outer_boundary(potential, cooling, R_sonic_kpc, R_boundary_kpc, boundary_value, R_max_kpc, R_min_kpc, boundary="temperature")`;
+use `boundary="timescale"` with a positive ratio instead of a temperature in K.
+Neither mode uses a Bernoulli-sign cut, so an additive potential constant
 cannot change the selected flow. The older `shoot_from_R_sonic` remains available
 for existing notebook workflows with its original bound/unbound selection.
+
+See `docs/review/outer_boundary_comparison.md` for both boundary conditions at
+sonic radii 1 and 20 kpc. Detected multiple roots are rejected by the generator;
+the comparison separately displays ambiguous branches as diagnostics.
 
 Run `python compare_outer_temperature.py --output-dir /path/to/new-comparison`
 to compare sonic radii 1 and 20 kpc at f_T=0.5, 1, and 2. This command accepts

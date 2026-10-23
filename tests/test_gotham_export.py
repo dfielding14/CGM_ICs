@@ -65,6 +65,7 @@ def test_export_roundtrip_and_no_overwrite(generated):
     assert metadata["boundary_radius_kpc"] == pytest.approx(boundary)
     assert metadata["boundary_temperature_K"] == pytest.approx(target)
     assert metadata["f_T"] == 1.
+    assert metadata["outer_boundary"] == "temperature"
     assert solution.radius_kpc[-1] >= boundary * (1 - 1e-12)
     temperature = np.exp(np.interp(np.log(boundary), np.log(solution.radius_kpc),
                                    np.log(solution.temperature_K)))
@@ -108,13 +109,14 @@ def test_exporter_passes_configurable_outer_temperature(generated, tmp_path, mon
     target = f_T * units.mu * us.M_P_G * (potential.vc_kms(boundary) * us.KM_TO_CM)**2 / (IC.CF.GC.GAMMA * IC.KB_CGS)
 
     def inspect_boundary(potential_arg, cooling, rs, rb, tb, rmax, rmin, **kwargs):
+        assert kwargs["boundary"] == "temperature"
         assert rs == 1.
         assert rb == boundary
         assert tb == pytest.approx(target)
         assert rmax >= boundary
         raise RuntimeError("checked boundary parameters")
 
-    monkeypatch.setattr(IC.CF, "shoot_from_R_sonic_outer_temperature", inspect_boundary)
+    monkeypatch.setattr(IC.CF, "shoot_from_R_sonic_outer_boundary", inspect_boundary)
     with pytest.raises(RuntimeError, match="checked boundary parameters"):
         IC.generate(source, tmp_path / "run", sonic_radius_kpc=1.,
                     f_T=f_T, boundary_radius_kpc=boundary)
@@ -182,3 +184,58 @@ def test_radial_resolution_convergence(generated):
     for name in ("temperature_K", "density_cgs", "velocity_kms"):
         reference = np.interp(np.log(coarse.radius_kpc), np.log(fine.radius_kpc), np.log(getattr(fine, name)))
         assert np.max(abs(np.expm1(reference - np.log(getattr(coarse, name))))) < 2e-4
+
+
+def test_timescale_boundary_export(generated, tmp_path):
+    source, _, config, units, _, _ = generated
+    destination = tmp_path / "timescale"
+    solution = IC.generate(source, destination, sonic_radius_kpc=1., cooling_to_flow_ratio=1.)
+    metadata = json.loads((destination / "ic_parameters.json").read_text())
+    assert metadata["outer_boundary"] == "timescale"
+    assert metadata["cooling_to_flow_ratio"] == 1.
+    assert "f_T" not in metadata
+    assert "boundary_temperature_K" not in metadata
+    boundary = 1.5 * config.getfloat("potential", "r_200") * units.kpc
+    table = np.loadtxt(destination / "tables/cgm_profiles.txt")
+    radius = table[:, 0] * units.kpc
+    temperature = table[:, 1] * units.temperature
+    density = table[:, 2] * units.density
+    velocity = table[:, 3] * units.kms
+    nh = us.density_to_nH_cm3(density, IC.CF.GC.X)
+    cooling = us.cooling_time_Gyr(density, us.sound_speed_squared_kms2(
+        temperature, IC.CF.GC.GAMMA, IC.CF.GC.MU), nh,
+        solution.cooling.lambda_cgs(temperature, nh), IC.CF.GC.GAMMA, IC.CF.GC.GAMMA_M1)
+    ratio = cooling / us.flow_time_Gyr(radius, velocity)
+    assert np.exp(np.interp(np.log(boundary), np.log(radius), np.log(ratio))) == pytest.approx(1., rel=2e-5)
+
+
+@pytest.mark.parametrize("options", [dict(cooling_to_flow_ratio=0),
+                                     dict(cooling_to_flow_ratio=np.nan),
+                                     dict(f_T=2., cooling_to_flow_ratio=1.)])
+def test_invalid_boundary_does_not_write(generated, tmp_path, options):
+    destination = tmp_path / "invalid"
+    with pytest.raises(ValueError):
+        IC.generate(generated[0], destination, **options)
+    assert not destination.exists()
+
+
+def test_cli_boundary_options_are_exclusive(generated, tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["generate_gotham_ics.py", str(generated[0]),
+                                    str(tmp_path / "invalid"), "--f-t", "1", "--cooling-to-flow"])
+    with pytest.raises(SystemExit) as error:
+        IC.main()
+    assert error.value.code == 2
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_cli_timescale_fiducial(tmp_path, monkeypatch):
+    def inspect_options(*args, **kwargs):
+        assert kwargs["cooling_to_flow_ratio"] == 1.
+        assert kwargs["f_T"] == 1.
+        raise RuntimeError("checked fiducial")
+
+    monkeypatch.setattr(IC, "generate", inspect_options)
+    monkeypatch.setattr("sys.argv", ["generate_gotham_ics.py", "athinput", str(tmp_path / "run"),
+                                    "--cooling-to-flow"])
+    with pytest.raises(RuntimeError, match="checked fiducial"):
+        IC.main()

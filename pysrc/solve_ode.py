@@ -377,11 +377,21 @@ def shoot_from_R_sonic(
 
 
 def shoot_from_R_sonic_outer_temperature(
+    potential, cooling, R_sonic_kpc, R_boundary_kpc, T_boundary_K,
+    R_max_kpc, R_min_kpc, *args, **kwargs,
+) -> CGMSolution:
+    """Temperature-boundary interface; numerical options are shared with the general solver."""
+    return shoot_from_R_sonic_outer_boundary(
+        potential, cooling, R_sonic_kpc, R_boundary_kpc, T_boundary_K,
+        R_max_kpc, R_min_kpc, *args, **kwargs)
+
+
+def shoot_from_R_sonic_outer_boundary(
     potential: Potential,
     cooling: Cooling,
     R_sonic_kpc: float,
     R_boundary_kpc: float,
-    T_boundary_K: float,
+    boundary_value: float,
     R_max_kpc: float,
     R_min_kpc: float,
     max_step: float = 0.1,
@@ -391,25 +401,30 @@ def shoot_from_R_sonic_outer_temperature(
     verbose: bool = False,
     atol: float = 1e-8,
     rtol: float = 1e-8,
+    boundary: str = "temperature",
 ) -> CGMSolution:
-    """Match a finite outer temperature on the supersonic-inward cooling branch.
+    """Match outer T [K] or t_cool/t_flow on the supersonic-inward cooling branch.
 
     Shoot in x = v_c^2/(2 c_s^2) at the sonic point. Only integrations reaching
-    R_boundary enter the temperature residual; failed trials are not cold gas.
+    R_boundary enter the residual. The timescale mode requires positive net cooling.
     No Bernoulli cutoff is applied. R_max controls table coverage, not the match.
     """
+    if boundary not in ("temperature", "timescale"):
+        raise ValueError("boundary must be 'temperature' or 'timescale'")
     parameters = [R_min_kpc, R_sonic_kpc, R_boundary_kpc, R_max_kpc,
-                  T_boundary_K, epsilon, min_temperature_K, atol, rtol]
+                  boundary_value, epsilon, min_temperature_K, atol, rtol]
     if (not np.all(np.isfinite(parameters)) or min(parameters) <= 0
             or not max_step > 0
             or not R_min_kpc < R_sonic_kpc * (1 - epsilon)
             or not R_sonic_kpc * (1 + epsilon) < R_boundary_kpc <= R_max_kpc
-            or T_boundary_K <= min_temperature_K):
+            or (boundary == "temperature" and boundary_value <= min_temperature_K)):
         raise ValueError("require positive finite inputs, R_min < R_sonic < R_boundary <= R_max, "
-                         "a sonic offset inside that interval, and T_boundary above the floor")
+                         "a sonic offset inside that interval, and any imposed T above the floor")
 
     trials = {}
+    boundary_values = {}
     failures = {}
+    label = "T [K]" if boundary == "temperature" else "t_cool/t_flow"
 
     def residual(x):
         if x not in trials:
@@ -425,18 +440,32 @@ def shoot_from_R_sonic_outer_temperature(
                         max_step, False, method, atol=atol, rtol=rtol, check_unbound=False)
                     if flow.stop_reason != StopReason.MAX_RADIUS:
                         raise RuntimeError(f"{flow.stop_reason.value} at {flow.radius_kpc[-1]:.6g} kpc")
-                    trials[x] = float(np.log(flow.temperature_K[-1] / T_boundary_K))
+                    if boundary == "temperature":
+                        actual = float(flow.temperature_K[-1])
+                        trials[x] = float(np.log(actual / boundary_value))
+                    else:
+                        tcool = float(flow.cooling_time_Gyr[-1])
+                        if not np.isfinite(tcool) or tcool <= 0:
+                            raise RuntimeError("boundary requires positive finite net cooling time")
+                        actual = tcool / float(flow.flow_time_Gyr[-1])
+                        # Use the inverse ratio so vanishing net cooling is not a pole.
+                        trials[x] = boundary_value / actual - 1
                     if not np.isfinite(trials[x]):
                         raise FloatingPointError("nonfinite boundary residual")
+                    boundary_values[x] = actual
             except (NoValidDensityError, NoTranssonicSolutionError, FloatingPointError,
                     ValueError, RuntimeError) as exc:
                 trials[x] = np.nan
                 failures[x] = str(exc) or type(exc).__name__
-            printv(f"x={x:.10g}: " + (f"ln(T/T_boundary)={trials[x]:.6g}"
+            printv(f"x={x:.10g}: " + (f"{label}={boundary_values[x]:.6g}; residual={trials[x]:.6g}"
                    if np.isfinite(trials[x]) else failures[x]), verbose)
         return trials[x]
 
-    for x in np.linspace(1e-5, 1 - 1e-5, 33):
+    grid = np.linspace(1e-5, 1 - 1e-5, 33)
+    if boundary == "timescale":
+        # Hot branches at small x can cross the same ratio more than once.
+        grid = np.unique(np.concatenate((grid, np.geomspace(1e-5, 1 - 1e-5, 33))))
+    for x in grid:
         residual(float(x))
     for _ in range(32):
         ordered = sorted(trials)
@@ -446,7 +475,7 @@ def shoot_from_R_sonic_outer_temperature(
                     and trials[a] * trials[b] < 0]
         if brackets:
             break
-        # Cold solutions can lie very close to where the outer branch ceases to exist.
+        # Valid boundary matches can lie close to where the outer branch ceases to exist.
         edges = [(a, b) for a, b in zip(ordered[:-1], ordered[1:])
                  if np.isfinite(trials[a]) != np.isfinite(trials[b])]
         if not edges:
@@ -454,20 +483,20 @@ def shoot_from_R_sonic_outer_temperature(
         for a, b in edges:
             residual(0.5 * (a + b))
     if not brackets:
-        reached = [T_boundary_K * np.exp(value) for value in trials.values() if np.isfinite(value)]
-        span = f"{min(reached):.6g}--{max(reached):.6g} K" if reached else "none"
-        raise RuntimeError(f"Could not bracket T({R_boundary_kpc:g} kpc)={T_boundary_K:g} K; "
-                           f"successful trial temperatures: {span}; {len(failures)} trials failed. "
+        reached = list(boundary_values.values())
+        span = f"{min(reached):.6g}--{max(reached):.6g}" if reached else "none"
+        raise RuntimeError(f"Could not bracket {label}({R_boundary_kpc:g} kpc)={boundary_value:g}; "
+                           f"successful trial values: {span}; {len(failures)} trials failed. "
                            "This search does not establish that no solution exists.")
     if len(brackets) > 1:
-        raise RuntimeError("Multiple outer-temperature brackets found; no unique flow selected")
+        raise RuntimeError(f"Multiple {label} brackets found; no unique flow selected")
     try:
         a, b = brackets[0]
         x = a if a == b else scipy.optimize.brentq(residual, a, b, xtol=1e-12, rtol=1e-12)
     except ValueError as exc:
-        raise RuntimeError("Temperature bracket contains a failed integration") from exc
+        raise RuntimeError("Outer-boundary bracket contains a failed integration") from exc
     if abs(residual(x)) > 1e-5:
-        raise RuntimeError("Shooting converged in x but did not match the boundary temperature")
+        raise RuntimeError(f"Shooting converged in x but did not match the boundary {label}")
 
     conditions = _calculate_sonic_point_conditions(x, R_sonic_kpc, potential, cooling, None)
     solution = _integrate_from_sonic_point(
@@ -475,7 +504,7 @@ def shoot_from_R_sonic_outer_temperature(
         epsilon, False, True, min_temperature_K, max_step, verbose, method,
         atol=atol, rtol=rtol, check_unbound=False)
     if not np.isclose(solution.radius_kpc[0], R_min_kpc, rtol=1e-8, atol=0):
-        raise RuntimeError(f"Matched outer temperature, but inward flow stops at {solution.radius_kpc[0]:g} kpc")
+        raise RuntimeError(f"Matched outer boundary, but inward flow stops at {solution.radius_kpc[0]:g} kpc")
     if R_max_kpc > R_boundary_kpc:
         extension = IntegrateFlowEquations(
             solution.mass_flow_rate_Msun_per_yr, solution.temperature_K[-1], solution.density_cgs[-1],
@@ -483,7 +512,7 @@ def shoot_from_R_sonic_outer_temperature(
             max_step=max_step, check_unbound=False, min_temperature_K=min_temperature_K,
             method=method, atol=atol, rtol=rtol)
         if extension.stop_reason != StopReason.MAX_RADIUS:
-            raise RuntimeError(f"Matched outer temperature, but extension stops at "
+            raise RuntimeError(f"Matched outer boundary, but extension stops at "
                                f"{extension.radius_kpc[-1]:g} kpc: {extension.stop_reason.value}")
         solution.result.t = np.concatenate((solution.result.t, extension.result.t[1:]))
         solution.result.y = np.concatenate((solution.result.y, extension.result.y[:, 1:]), axis=1)
