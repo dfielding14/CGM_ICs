@@ -343,6 +343,115 @@ def shoot_from_R_sonic(
     return None
 
 
+def shoot_from_R_sonic_outer_temperature(
+    potential: Potential,
+    cooling: Cooling,
+    R_sonic_kpc: float,
+    R_boundary_kpc: float,
+    T_boundary_K: float,
+    R_max_kpc: float,
+    R_min_kpc: float,
+    max_step: float = 0.1,
+    epsilon: float = 1e-4,
+    min_temperature_K: float = 2e4,
+    method: str = "RK45",
+    verbose: bool = False,
+) -> CGMSolution:
+    """Match a finite outer temperature on the supersonic-inward cooling branch.
+
+    Shoot in x = v_c^2/(2 c_s^2) at the sonic point. Only integrations reaching
+    R_boundary enter the temperature residual; failed trials are not cold gas.
+    No Bernoulli cutoff is applied. R_max controls table coverage, not the match.
+    """
+    parameters = [R_min_kpc, R_sonic_kpc, R_boundary_kpc, R_max_kpc,
+                  T_boundary_K, epsilon, max_step, min_temperature_K]
+    if (not np.all(np.isfinite(parameters)) or min(parameters) <= 0
+            or not R_min_kpc < R_sonic_kpc * (1 - epsilon)
+            or not R_sonic_kpc * (1 + epsilon) < R_boundary_kpc <= R_max_kpc
+            or T_boundary_K <= min_temperature_K):
+        raise ValueError("require positive finite inputs, R_min < R_sonic < R_boundary <= R_max, "
+                         "a sonic offset inside that interval, and T_boundary above the floor")
+
+    trials = {}
+    failures = {}
+
+    def residual(x):
+        if x not in trials:
+            try:
+                with np.errstate(over="raise", divide="raise", invalid="raise"):
+                    conditions = _calculate_sonic_point_conditions(
+                        x, R_sonic_kpc, potential, cooling, None)
+                    if conditions["dlnM_dlnR"] >= 0:
+                        raise NoTranssonicSolutionError("no supersonic-inward sonic branch")
+                    flow = _integrate_from_sonic_point(
+                        conditions, potential, cooling, R_sonic_kpc, R_boundary_kpc,
+                        R_min_kpc, epsilon, False, False, min_temperature_K,
+                        max_step, False, method, check_unbound=False)
+                    if flow.stop_reason != StopReason.MAX_RADIUS:
+                        raise RuntimeError(f"{flow.stop_reason.value} at {flow.radius_kpc[-1]:.6g} kpc")
+                    trials[x] = float(np.log(flow.temperature_K[-1] / T_boundary_K))
+                    if not np.isfinite(trials[x]):
+                        raise FloatingPointError("nonfinite boundary residual")
+            except (NoValidDensityError, NoTranssonicSolutionError, FloatingPointError,
+                    ValueError, RuntimeError) as exc:
+                trials[x] = np.nan
+                failures[x] = str(exc) or type(exc).__name__
+            printv(f"x={x:.10g}: " + (f"ln(T/T_boundary)={trials[x]:.6g}"
+                   if np.isfinite(trials[x]) else failures[x]), verbose)
+        return trials[x]
+
+    for x in np.linspace(1e-5, 1 - 1e-5, 33):
+        residual(float(x))
+    for _ in range(32):
+        ordered = sorted(trials)
+        brackets = [(x, x) for x in ordered if trials[x] == 0]
+        brackets += [(a, b) for a, b in zip(ordered[:-1], ordered[1:])
+                    if np.isfinite(trials[a]) and np.isfinite(trials[b])
+                    and trials[a] * trials[b] < 0]
+        if brackets:
+            break
+        # Cold solutions can lie very close to where the outer branch ceases to exist.
+        edges = [(a, b) for a, b in zip(ordered[:-1], ordered[1:])
+                 if np.isfinite(trials[a]) != np.isfinite(trials[b])]
+        if not edges:
+            break
+        for a, b in edges:
+            residual(0.5 * (a + b))
+    if not brackets:
+        reached = [T_boundary_K * np.exp(value) for value in trials.values() if np.isfinite(value)]
+        span = f"{min(reached):.6g}--{max(reached):.6g} K" if reached else "none"
+        raise RuntimeError(f"Could not bracket T({R_boundary_kpc:g} kpc)={T_boundary_K:g} K; "
+                           f"successful trial temperatures: {span}; {len(failures)} trials failed. "
+                           "This search does not establish that no solution exists.")
+    if len(brackets) > 1:
+        raise RuntimeError("Multiple outer-temperature brackets found; no unique flow selected")
+    try:
+        a, b = brackets[0]
+        x = a if a == b else scipy.optimize.brentq(residual, a, b, xtol=1e-12, rtol=1e-12)
+    except ValueError as exc:
+        raise RuntimeError("Temperature bracket contains a failed integration") from exc
+    if abs(residual(x)) > 1e-5:
+        raise RuntimeError("Shooting converged in x but did not match the boundary temperature")
+
+    conditions = _calculate_sonic_point_conditions(x, R_sonic_kpc, potential, cooling, None)
+    solution = _integrate_from_sonic_point(
+        conditions, potential, cooling, R_sonic_kpc, R_boundary_kpc, R_min_kpc,
+        epsilon, False, True, min_temperature_K, max_step, verbose, method, check_unbound=False)
+    if not np.isclose(solution.radius_kpc[0], R_min_kpc, rtol=1e-8, atol=0):
+        raise RuntimeError(f"Matched outer temperature, but inward flow stops at {solution.radius_kpc[0]:g} kpc")
+    if R_max_kpc > R_boundary_kpc:
+        extension = IntegrateFlowEquations(
+            solution.mass_flow_rate_Msun_per_yr, solution.temperature_K[-1], solution.density_cgs[-1],
+            potential, cooling, 1, R_boundary_kpc, R_max_kpc,
+            max_step=max_step, check_unbound=False, min_temperature_K=min_temperature_K, method=method)
+        if extension.stop_reason != StopReason.MAX_RADIUS:
+            raise RuntimeError(f"Matched outer temperature, but extension stops at "
+                               f"{extension.radius_kpc[-1]:g} kpc: {extension.stop_reason.value}")
+        solution.result.t = np.concatenate((solution.result.t, extension.result.t[1:]))
+        solution.result.y = np.concatenate((solution.result.y, extension.result.y[:, 1:]), axis=1)
+    return solution
+
+
 def shoot_from_R_circ(
     potential: Potential,
     cooling: Cooling,
@@ -617,6 +726,7 @@ def _integrate_from_sonic_point(
     max_step: float,
     verbose: bool,
     method: str,
+    check_unbound: bool = True,
 ) -> CGMSolution:
     return _integrate_flow_sonic(
         sonic_conditions["mass_flow_rate_Msun_per_yr"],
@@ -637,6 +747,7 @@ def _integrate_from_sonic_point(
         max_step,
         verbose,
         method,
+        check_unbound,
     )
 
 
@@ -659,6 +770,7 @@ def _integrate_flow_sonic(
     max_step: float,
     verbose: bool,
     method: str,
+    check_unbound: bool = True,
 ) -> CGMSolution:
     res = None
     integration_directions = [1, -1] if calc_inward_solution else [1]
@@ -680,7 +792,7 @@ def _integrate_flow_sonic(
                 R_min_kpc=radius0_kpc,
                 R_max_kpc=R_max_kpc,
                 terminal_unbound=terminal_unbound,
-                check_unbound=True,
+                check_unbound=check_unbound,
                 is_supersonic=is_supersonic,
                 min_temperature_K=min_temperature_K,
                 max_step=max_step,
@@ -725,7 +837,7 @@ def _calculate_sonic_point_conditions(
     R_sonic_kpc: float,
     potential: Potential,
     cooling: Cooling,
-    dlnM_dlnR_init: float,
+    dlnM_dlnR_init: Optional[float],
 ) -> Dict[str, float]:
     cs2_kms2, velocity_kms, temperature_K, tflow_to_tcool, density_cgs = _get_ics(
         x,
@@ -848,11 +960,15 @@ def _calc_dlnT_dlnR_at_sonic_point(
 def _choose_root(
     dlnT_dlnR_1: float,
     dlnT_dlnR_2: float,
-    dlnM_dlnR_ref: float,
+    dlnM_dlnR_ref: Optional[float],
     x: float,
 ) -> Tuple[float, float]:
     dlnM_dlnR_1 = (1.0 - x) * 2.0 * GC.GAMMA / GC.GAMMA_M1 - 2.0 - (0.5 + 1.0 / GC.GAMMA_M1) * dlnT_dlnR_1
     dlnM_dlnR_2 = (1.0 - x) * 2.0 * GC.GAMMA / GC.GAMMA_M1 - 2.0 - (0.5 + 1.0 / GC.GAMMA_M1) * dlnT_dlnR_2
+    if dlnM_dlnR_ref is None:
+        if dlnM_dlnR_1 < dlnM_dlnR_2:
+            return float(dlnT_dlnR_1), float(dlnM_dlnR_1)
+        return float(dlnT_dlnR_2), float(dlnM_dlnR_2)
     if abs(dlnM_dlnR_1 - dlnM_dlnR_ref) < abs(dlnM_dlnR_2 - dlnM_dlnR_ref):
         return float(dlnT_dlnR_1), float(dlnM_dlnR_1)
     return float(dlnT_dlnR_2), float(dlnM_dlnR_2)

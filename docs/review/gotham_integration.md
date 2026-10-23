@@ -58,8 +58,27 @@ $$
 
 The angular quadrature has 64 nodes. The radial force is differentiated
 analytically before angular averaging. The default sonic radius is 0.7 kpc;
-the inner radial endpoint is 0.1 kpc. With the reviewed template the inferred
-mass inflow rate is approximately $0.146\,M_\odot\,{\rm yr}^{-1}$.
+the inner radial endpoint is 0.1 kpc. The outer temperature condition is
+
+$$
+T(R_b)=f_T\frac{\mu m_p}{\gamma k_B}v_c^2(R_b),
+\qquad R_b=1.5R_{200}\ \text{by default}.
+$$
+
+Both $R_b$ (`--r-boundary`, kpc) and $f_T$ (`--f-t`, default 1) are parameters.
+The default $f_T=1$ equates adiabatic sound speed and circular speed at $R_b$.
+The sonic temperature is adjusted to match this boundary; density and mass
+inflow rate are outputs. The endpoint includes both the physical matching radius
+and corner ghost cells, whichever is farther out. The solver requires
+$0.1\,{\rm kpc}<R_{\rm sonic}<R_b$ and permits sonic points beyond the mesh.
+
+This boundary replaces the exporter's former bound/unbound trial selection.
+The outer-halo potential is confining and has no finite zero at infinity, so
+the sign of its Bernoulli parameter cannot define escape. The temperature mode
+therefore disables that rejection and is invariant under additive potential
+offsets. The older `shoot_from_R_sonic` retains its behavior for notebook users.
+The former baseline export's approximately $0.146\,M_\odot\,{\rm yr}^{-1}$ was
+selected by that older criterion and is not a prediction of the new boundary.
 
 The disk retains $M_d=2.5\times10^9\,M_\odot$, $T_d=10^4$ K, and a 20 kpc
 outer cutoff. Its surface density is exponential with the input's stellar
@@ -96,9 +115,12 @@ first supernova.
 
 ## Validation
 
-- 31 Python tests pass, including execution of all example notebooks, raw-HDF5
+- Python tests cover execution of all example notebooks, raw-HDF5
   cooling comparisons, signed heating, dilute sonic roots, rotating forces,
   solver failure handling, disk mass, cluster units, and exported mass flux.
+- Outer-temperature regressions recover a known transonic flow, check invariance
+  under potential offsets, separate matching radius from profile extent, and
+  reject a matched branch that encounters a second sonic point during extension.
 - Independent momentum and energy residuals are checked along an exported flow.
   Halving its maximum log-radius step changes temperature, density, and velocity
   by less than $2\times10^{-4}$ in the regression case.

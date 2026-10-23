@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 from scipy.integrate import quad, trapezoid
@@ -57,6 +59,16 @@ particle_type = star
 def test_export_roundtrip_and_no_overwrite(generated):
     source, destination, config, units, potential, solution = generated
     output = IC.read_input(destination / "athinput.gotham")
+    metadata = json.loads((destination / "ic_parameters.json").read_text())
+    boundary = 1.5 * config.getfloat("potential", "r_200") * units.kpc
+    target = units.mu * us.M_P_G * (potential.vc_kms(boundary) * us.KM_TO_CM)**2 / (IC.CF.GC.GAMMA * IC.KB_CGS)
+    assert metadata["boundary_radius_kpc"] == pytest.approx(boundary)
+    assert metadata["boundary_temperature_K"] == pytest.approx(target)
+    assert metadata["f_T"] == 1.
+    assert solution.radius_kpc[-1] >= boundary * (1 - 1e-12)
+    temperature = np.exp(np.interp(np.log(boundary), np.log(solution.radius_kpc),
+                                   np.log(solution.temperature_K)))
+    assert temperature == pytest.approx(target, rel=2e-5)
     assert output.getfloat("hydro", "T_max") == 5e8
     expected_cooling = IC.Cool.Wiersma_Cooling((1 - 1e-7) / 3, 0)
     assert solution.cooling.lambda_cgs(1e6, 1e-4) == pytest.approx(
@@ -88,6 +100,25 @@ def test_monopole_force_and_potential_agree(generated):
         expected, _ = quad(lambda mu: potential.phi_cylindrical_kms2(r * np.sqrt(1 - mu*mu), r * mu),
                            0, 1, epsabs=1e-8, epsrel=1e-10)
         assert potential.phi_kms2(r) == pytest.approx(expected, rel=1e-7)
+
+
+def test_exporter_passes_configurable_outer_temperature(generated, tmp_path, monkeypatch):
+    source, _, _, units, potential, _ = generated
+    boundary, f_T = 100., .5
+    target = f_T * units.mu * us.M_P_G * (potential.vc_kms(boundary) * us.KM_TO_CM)**2 / (IC.CF.GC.GAMMA * IC.KB_CGS)
+
+    def inspect_boundary(potential_arg, cooling, rs, rb, tb, rmax, rmin, **kwargs):
+        assert rs == 1.
+        assert rb == boundary
+        assert tb == pytest.approx(target)
+        assert rmax >= boundary
+        raise RuntimeError("checked boundary parameters")
+
+    monkeypatch.setattr(IC.CF, "shoot_from_R_sonic_outer_temperature", inspect_boundary)
+    with pytest.raises(RuntimeError, match="checked boundary parameters"):
+        IC.generate(source, tmp_path / "run", sonic_radius_kpc=1.,
+                    f_T=f_T, boundary_radius_kpc=boundary)
+    assert not (tmp_path / "run").exists()
 
 
 def test_disk_has_requested_mass_in_full_potential(generated):
@@ -142,8 +173,11 @@ def test_flow_satisfies_momentum_and_energy_equations(generated):
 
 def test_radial_resolution_convergence(generated):
     coarse = generated[5]
-    fine = IC.CF.shoot_from_R_sonic(coarse.potential, coarse.cooling, 0.7,
-                                   coarse.radius_kpc[-1], 0.1, max_step=0.001, epsilon=1e-4)
+    metadata = json.loads((generated[1] / "ic_parameters.json").read_text())
+    fine = IC.CF.shoot_from_R_sonic_outer_temperature(
+        coarse.potential, coarse.cooling, 0.7, metadata["boundary_radius_kpc"],
+        metadata["boundary_temperature_K"], metadata["outer_radius_kpc"], 0.1,
+        max_step=0.001, epsilon=1e-4)
     assert fine.mass_flow_rate_Msun_per_yr == pytest.approx(coarse.mass_flow_rate_Msun_per_yr, rel=1e-4)
     for name in ("temperature_K", "density_cgs", "velocity_kms"):
         reference = np.interp(np.log(coarse.radius_kpc), np.log(fine.radius_kpc), np.log(getattr(fine, name)))

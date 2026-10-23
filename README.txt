@@ -78,7 +78,7 @@ Install the dependencies and pass the GOTHAM input that will be used for the run
 
 ```bash
 python -m pip install -r requirements.txt
-python generate_gotham_ics.py /path/to/athenak/inputs/gotham/athinput.gotham /path/to/new-run --r-sonic 0.7
+python generate_gotham_ics.py /path/to/athenak/inputs/gotham/athinput.gotham /path/to/new-run --r-sonic 1 --f-t 1
 cd /path/to/new-run
 /path/to/athena -i athinput.gotham
 ```
@@ -91,6 +91,38 @@ The shipped template has tlim=10 and SN/delay=10, so it ends before feedback sta
 The defaults retain the historical 2.5e9 Msun, 1e4 K, 20 kpc gas disk and 1500
 star clusters. The sonic radius is in kpc. The example notebooks do not export
 this production bundle; existing tracked tables and pickles are historical products.
+
+The CGM temperature is matched at 1.5 times the input's `potential/r_200` by
+default. Override that physical radius with `--r-boundary R_KPC`. The condition is
+
+$$
+T(R_b)=f_T\frac{\mu m_p}{\gamma k_B}v_c^2(R_b),
+\qquad v_c^2=r\frac{d\bar\Phi}{dr}.
+$$
+
+Thus `--f-t 1` sets the adiabatic sound speed equal to the circular speed at
+the boundary. The spherical angular-mean potential supplies $v_c$. The sonic
+temperature is varied to satisfy this condition; density and accretion rate are
+outputs. The matching radius is independent of mesh geometry. Profiles extend
+to whichever is larger: the matching radius or the outer corner ghost cells.
+Require $0.1\,{\rm kpc}<R_{\rm sonic}<R_b$; the sonic radius can exceed the mesh
+radius. The output `ic_parameters.json` records $R_b$, target temperature, and
+$f_T$. Failure to match the target or cover the requested radial interval raises
+an error. The finite shooting search does not prove global uniqueness or
+nonexistence; the imposed outer temperature must exceed 20,000 K.
+
+The corresponding Python API is
+`generate(athinput, output_dir, sonic_radius_kpc=1, f_T=1, boundary_radius_kpc=None)`.
+For direct solver use, call
+`shoot_from_R_sonic_outer_temperature(potential, cooling, R_sonic_kpc, R_boundary_kpc, T_boundary_K, R_max_kpc, R_min_kpc)`.
+This mode does not use a Bernoulli-sign cut, so an additive potential constant
+cannot change the selected flow. The older `shoot_from_R_sonic` remains available
+for existing notebook workflows with its original bound/unbound selection.
+
+Run `python compare_outer_temperature.py --output-dir /path/to/new-comparison`
+to compare sonic radii 1 and 20 kpc at f_T=0.5, 1, and 2. This command accepts
+`--athinput` and `--r-boundary-kpc`. Results and the fiducial figures are described
+in `docs/review/outer_temperature_comparison.md`.
 
 ## Tests
 

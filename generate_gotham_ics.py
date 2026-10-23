@@ -128,7 +128,8 @@ def disk_profile(potential, units, zmin_kpc, zmax_kpc, mass_Msun=2.5e9, temperat
                             density / units.density, np.zeros_like(radius)))
 
 
-def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42):
+def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
+             f_T=1.0, boundary_radius_kpc=None):
     output_dir = Path(output_dir)
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite {output_dir}")
@@ -138,6 +139,15 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42):
     if not np.isclose(config.getfloat(fluid, "gamma"), CF.GC.GAMMA, rtol=1e-8, atol=0):
         raise ValueError("the cooling-flow solver assumes gamma=5/3")
     potential = GalaxyPotential(config, units)
+    if boundary_radius_kpc is None:
+        boundary_radius_kpc = 1.5 * config.getfloat("potential", "r_200") * units.kpc
+    if not np.isfinite(f_T) or f_T <= 0:
+        raise ValueError("f_T must be finite and positive")
+    if not np.isfinite(boundary_radius_kpc) or not 0.1 < sonic_radius_kpc < boundary_radius_kpc:
+        raise ValueError("require 0.1 kpc < sonic radius < boundary radius")
+    boundary_temperature_K = float(f_T * units.mu * us.M_P_G
+                                   * (potential.vc_kms(boundary_radius_kpc) * us.KM_TO_CM)**2
+                                   / (CF.GC.GAMMA * KB_CGS))
     metallicity = config.getfloat("problem", "metallicity", fallback=1/3)
     # GOTHAM gives the CGM D_floor; d_z_init is only applied to disk material.
     dust_fraction = config.getfloat("dust", "D_floor", fallback=1e-20)
@@ -156,12 +166,12 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42):
         if axis < 3 and min(-lo, hi) * units.kpc < 20:
             raise ValueError("the mesh must contain the 20 kpc disk in both horizontal directions")
         outer_coordinates.append(max(abs(lo), abs(hi)) + (ghost + 0.5) * (hi - lo) / nx)
-    outer_radius = np.linalg.norm(outer_coordinates) * units.kpc
-    if not 0.1 < sonic_radius_kpc < outer_radius:
-        raise ValueError("require 0.1 kpc < sonic radius < outer mesh radius")
+    mesh_radius = np.linalg.norm(outer_coordinates) * units.kpc
+    outer_radius = max(mesh_radius, boundary_radius_kpc)
     # Resolve the sharp inner cooling transition in the table read by GOTHAM.
-    solution = CF.shoot_from_R_sonic(potential, cooling, sonic_radius_kpc, outer_radius, 0.1,
-                                    max_step=0.002, epsilon=1e-4, verbose=True)
+    solution = CF.shoot_from_R_sonic_outer_temperature(
+        potential, cooling, sonic_radius_kpc, boundary_radius_kpc, boundary_temperature_K,
+        outer_radius, 0.1, max_step=0.002, epsilon=1e-4, verbose=True)
     if solution is None or not np.isclose(solution.radius_kpc[-1], outer_radius, rtol=1e-8):
         raise RuntimeError("no cooling flow reaches the outer mesh, including ghost cells")
     if not np.isclose(solution.radius_kpc[0], 0.1, rtol=1e-8):
@@ -212,6 +222,8 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42):
     metadata = dict(source_input=str(Path(athinput).resolve()), sonic_radius_kpc=sonic_radius_kpc,
                     mass_flow_Msun_per_yr=solution.mass_flow_rate_Msun_per_yr,
                     outer_radius_kpc=outer_radius, gas_metallicity_solar=metallicity * (1 - dust_fraction),
+                    mesh_radius_kpc=mesh_radius, boundary_radius_kpc=boundary_radius_kpc,
+                    boundary_temperature_K=boundary_temperature_K, f_T=f_T,
                     seed=seed, cgm_gravity="angular mean of the GOTHAM potential",
                     cooling="optically thin z=0 Wiersma; no local heating or shielding",
                     disk_mass_Msun=2.5e9, disk_temperature_K=1e4,
@@ -226,9 +238,14 @@ def main():
     parser.add_argument("athinput", type=Path)
     parser.add_argument("output_dir", type=Path, help="new run directory; existing directories are never overwritten")
     parser.add_argument("--r-sonic", type=float, default=0.7, help="sonic radius in kpc (default: 0.7)")
+    parser.add_argument("--r-boundary", type=float,
+                        help="temperature matching radius in kpc (default: 1.5 times input r_200)")
+    parser.add_argument("--f-t", type=float, default=1.0,
+                        help="outer c_s^2/v_c^2, with adiabatic sound speed (default: 1)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    solution = generate(args.athinput, args.output_dir, args.r_sonic, args.seed)
+    solution = generate(args.athinput, args.output_dir, args.r_sonic, args.seed,
+                        f_T=args.f_t, boundary_radius_kpc=args.r_boundary)
     print(f"Wrote {args.output_dir}: Mdot={solution.mass_flow_rate_Msun_per_yr:.8g} Msun/yr")
 
 
