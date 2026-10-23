@@ -178,13 +178,14 @@ def disk_profile(potential, units, zmin_kpc, zmax_kpc, mass_Msun=2.5e9, temperat
 
 
 def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
-             f_T=1.0, boundary_radius_kpc=None, cooling_to_flow_ratio=None):
+             f_T=1.0, boundary_radius_kpc=None, cooling_to_flow_ratio=None, no_disk=False):
     from ClusterGenerator import ClusterParameters, StarClusterGenerator
 
     output_dir = Path(output_dir)
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite {output_dir}")
     config = read_input(athinput)
+    initialize_disk = config.getboolean("problem", "initialize_disk", fallback=True) and not no_disk
     units = CodeUnits(config)
     potential = GalaxyPotential(config, units)
     if boundary_radius_kpc is None:
@@ -205,10 +206,11 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
     metallicity = config.getfloat("problem", "metallicity", fallback=1/3)
     dust_fraction = config.getfloat("dust", "D_floor", fallback=1e-20)
     mesh_radius = outer_mesh_radius(config, units)
-    for axis in (1, 2):
-        lo, hi = (config.getfloat("mesh", f"x{axis}{side}") for side in ("min", "max"))
-        if min(-lo, hi) * units.kpc < 20:
-            raise ValueError("the mesh must contain the 20 kpc disk in both horizontal directions")
+    if initialize_disk:
+        for axis in (1, 2):
+            lo, hi = (config.getfloat("mesh", f"x{axis}{side}") for side in ("min", "max"))
+            if min(-lo, hi) * units.kpc < 20:
+                raise ValueError("the mesh must contain the 20 kpc disk in both horizontal directions")
     outer_radius = max(mesh_radius, boundary_radius_kpc)
     flow_potential = TabulatedPotential(potential, 0.1, outer_radius)
     boundary = "temperature" if cooling_to_flow_ratio is None else "timescale"
@@ -228,8 +230,10 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
         raise ValueError("the flow extends beyond GOTHAM's cooling-table domain")
     cgm = np.column_stack((solution.radius_kpc / units.kpc, solution.temperature_K / units.temperature,
                            solution.density_cgs / units.density, solution.velocity_kms / units.kms))
-    disk = disk_profile(potential, units, config.getfloat("mesh", "x3min") * units.kpc,
-                        config.getfloat("mesh", "x3max") * units.kpc)
+    disk = None
+    if initialize_disk:
+        disk = disk_profile(potential, units, config.getfloat("mesh", "x3min") * units.kpc,
+                            config.getfloat("mesh", "x3max") * units.kpc)
     generator = StarClusterGenerator(ClusterParameters(n_clusters=1500, radius_kpc=0.5))
     clusters = generator.generate_clusters(seed=seed)
     generator.set_velocity_profile(lambda r_pc: potential.equatorial_vc_kms(r_pc / 1000))
@@ -239,14 +243,18 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
                              clusters.vz.to_numpy() * 10 / units.kms,
                              clusters.t_min.to_numpy() * 1e8 * us.YR_TO_S / units.time,
                              clusters.mass_msun.to_numpy()))
-    for data in (cgm, disk, stars):
+    for data in ((cgm, disk, stars) if initialize_disk else (cgm, stars)):
         if not np.all(np.isfinite(data)):
             raise ValueError("nonfinite values in generated ICs")
-    if np.any(cgm[:, 1:3] <= 0) or np.any(disk[:, 1:3] <= 0):
+    if np.any(cgm[:, 1:3] <= 0) or (initialize_disk and np.any(disk[:, 1:3] <= 0)):
         raise ValueError("profile temperature and density must be positive")
 
     config.set("problem", "profile_file", "tables/cgm_profiles.txt")
-    config.set("problem", "disk_profile_file", "tables/disk_profiles.txt")
+    config.set("problem", "initialize_disk", str(initialize_disk).lower())
+    if initialize_disk:
+        config.set("problem", "disk_profile_file", "tables/disk_profiles.txt")
+    else:
+        config.remove_option("problem", "disk_profile_file")
     rcirc = config.getfloat("problem", "r_circ") * units.kpc
     if not np.isfinite(rcirc) or rcirc < 0:
         raise ValueError("r_circ must be finite and nonnegative")
@@ -257,7 +265,8 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
     output_dir.mkdir(parents=True, exist_ok=False)
     (output_dir / "tables").mkdir()
     np.savetxt(output_dir / "tables/cgm_profiles.txt", cgm, header="r T rho v_inflow [code units]")
-    np.savetxt(output_dir / "tables/disk_profiles.txt", disk, header="R T rho_midplane v_unused [code units]")
+    if initialize_disk:
+        np.savetxt(output_dir / "tables/disk_profiles.txt", disk, header="R T rho_midplane v_unused [code units]")
     np.savetxt(output_dir / "tables/clusters.txt", stars,
                header="x y z vx vy vz t_creation [code units]; mass [Msun]")
     with (output_dir / "athinput.gotham").open("w") as handle:
@@ -273,7 +282,7 @@ def generate(athinput, output_dir, sonic_radius_kpc=0.7, seed=42,
                     outer_boundary=boundary,
                     seed=seed, cgm_gravity="angular mean of the GOTHAM potential",
                     cooling="optically thin z=0 Wiersma; no local heating or shielding",
-                    disk_mass_Msun=2.5e9, disk_temperature_K=1e4,
+                    disk_mass_Msun=2.5e9 if initialize_disk else 0, disk_temperature_K=1e4,
                     disk_vertical_interval_kpc=[config.getfloat("mesh", "x3min") * units.kpc,
                                                 config.getfloat("mesh", "x3max") * units.kpc])
     if boundary == "temperature":
@@ -297,10 +306,11 @@ def main():
     boundary_options.add_argument("--cooling-to-flow", type=float, nargs="?", const=1.0,
                                   help="outer net t_cool/t_flow (default when selected: 1)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-disk", action="store_true", help="omit the initial gas disk; retain stellar gravity")
     args = parser.parse_args()
     solution = generate(args.athinput, args.output_dir, args.r_sonic, args.seed,
                         f_T=args.f_t, boundary_radius_kpc=args.r_boundary,
-                        cooling_to_flow_ratio=args.cooling_to_flow)
+                        cooling_to_flow_ratio=args.cooling_to_flow, no_disk=args.no_disk)
     print(f"Wrote {args.output_dir}: Mdot={solution.mass_flow_rate_Msun_per_yr:.8g} Msun/yr")
 
 

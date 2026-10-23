@@ -103,6 +103,27 @@ def test_monopole_force_and_potential_agree(generated):
         assert potential.phi_kms2(r) == pytest.approx(expected, rel=1e-7)
 
 
+@pytest.mark.parametrize("from_input", [False, True])
+def test_export_without_initial_gas_disk(generated, tmp_path, monkeypatch, from_input):
+    source, _, _, _, _, solution = generated
+    monkeypatch.setattr(IC.CF, "shoot_from_R_sonic_outer_boundary", lambda *a, **kw: solution)
+    if from_input:
+        copied = tmp_path / "athinput"
+        copied.write_text(source.read_text().replace("<problem>", "<problem>\ninitialize_disk = false"))
+        source = copied
+    destination = tmp_path / "no-disk"
+    IC.generate(source, destination, no_disk=not from_input)
+    output = IC.read_input(destination / "athinput.gotham")
+    metadata = json.loads((destination / "ic_parameters.json").read_text())
+    assert not output.getboolean("problem", "initialize_disk")
+    assert not output.has_option("problem", "disk_profile_file")
+    assert not (destination / "tables/disk_profiles.txt").exists()
+    assert metadata["disk_mass_Msun"] == 0
+    assert output.getfloat("potential", "mass_gal") == 6500
+    assert (destination / "tables/cgm_profiles.txt").is_file()
+    assert np.loadtxt(destination / "tables/clusters.txt").shape == (1500, 8)
+
+
 def test_exporter_passes_configurable_outer_temperature(generated, tmp_path, monkeypatch):
     source, _, _, units, potential, _ = generated
     boundary, f_T = 100., .5

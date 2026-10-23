@@ -102,6 +102,13 @@ The analytic mass normalization includes the radial cutoff. GOTHAM computes
 pressure-supported disk rotation when reading the profile. This continuum
 normalization does not guarantee the same mass on an underresolved mesh.
 
+Use `--no-disk` to omit this initial gas component. The exporter writes
+`problem/initialize_disk = false` and omits the disk table and its file path;
+GOTHAM skips both reading and adding the gas disk. The same setting in an input
+file is preserved on regeneration. Stellar-disk gravity, CGM rotation and
+turbulence, cluster generation, and feedback timing are retained. Existing
+inputs without this setting continue to initialize a gas disk.
+
 The historical cluster prescription is retained: 1500 clusters inside 0.5 kpc,
 uniform in disk area, heights within 10 pc, masses between $10^4$ and $10^6$
 $M_\odot$ drawn from a slope-two power law, formation times within 10 Myr,

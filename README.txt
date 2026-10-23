@@ -51,6 +51,8 @@ The rotation and turbulence additions in this repo are analytic diagnostic layer
 - `generate_gotham_ics.py`
   - Writes a complete GOTHAM run directory: CGM and disk profiles, star clusters,
     an updated athinput, and a record of the generation parameters.
+    Use `--no-disk` to omit the initial gas disk while retaining stellar gravity
+    and clusters; GOTHAM must support `problem/initialize_disk = false`.
 - `ipynb/m82_cooling_flow_walkthrough.ipynb`
   - Main end-to-end tutorial notebook.
   - Builds an M82-motivated halo, sweeps `R_sonic`, compares the full solution family, and then layers on rotation and turbulence diagnostics.
